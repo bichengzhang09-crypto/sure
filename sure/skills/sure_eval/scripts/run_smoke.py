@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from container_execution import build_local_container_command, effective_container_exit_code
+from container_execution import build_api_execution_command, build_local_container_command, deployment_execution_mode, effective_container_exit_code
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -254,29 +254,46 @@ def main() -> int:
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / "smoke_test.log"
     device_request = _device_request(surface, eval_input)
-    command, _ = build_local_container_command(
-        surface=surface,
-        eval_input=eval_input,
-        control_run_dir=run_dir.resolve(),
-        entrypoint=entrypoint_path.resolve(),
-        repo_root=Path(__file__).resolve().parents[4],
-        device_request=device_request,
-        extra_env={
-            **_local_device_env(device_request),
-            "SMOKE_ONLY": "1",
-            "SMOKE_TEST_SAMPLES": str(smoke_samples),
-            "SURE_EVAL_EXECUTION_PATH": "local_docker_smoke",
-            "SURE_EVAL_EXECUTION_REQUESTED": _execution_requested(surface),
-        },
-    )
+    deployment_mode = deployment_execution_mode(eval_input)
+    smoke_execution_path = "api" if deployment_mode == "api_only" else "local_docker_smoke"
+    extra_env = {
+        **_local_device_env(device_request),
+        "SMOKE_ONLY": "1",
+        "SMOKE_TEST_SAMPLES": str(smoke_samples),
+        "SURE_EVAL_EXECUTION_PATH": smoke_execution_path,
+        "SURE_EVAL_EXECUTION_REQUESTED": _execution_requested(surface),
+    }
+    if deployment_mode == "api_only":
+        command, _, command_env = build_api_execution_command(
+            surface=surface,
+            eval_input=eval_input,
+            control_run_dir=run_dir.resolve(),
+            entrypoint=entrypoint_path.resolve(),
+            repo_root=Path(__file__).resolve().parents[4],
+            device_request=device_request,
+            extra_env=extra_env,
+        )
+    else:
+        command, _ = build_local_container_command(
+            surface=surface,
+            eval_input=eval_input,
+            control_run_dir=run_dir.resolve(),
+            entrypoint=entrypoint_path.resolve(),
+            repo_root=Path(__file__).resolve().parents[4],
+            device_request=device_request,
+            extra_env=extra_env,
+        )
+        command_env = {}
 
     exit_code = 1
     try:
         with log_path.open("w", encoding="utf-8") as log:
+            child_env = os.environ.copy()
+            child_env.update(command_env)
             completed = subprocess.run(
                 command,
                 cwd=str(Path(__file__).resolve().parents[4]),
-                env=os.environ.copy(),
+                env=child_env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 text=True,

@@ -1532,6 +1532,7 @@ def _write_protocol_yaml(
     inventory_container = _safe_dict(runtime_inventory.get("container_runtime"))
     inventory_local = _safe_dict(runtime_inventory.get("local_runtime"))
     inventory_policy = _safe_dict(runtime_inventory.get("policy"))
+    api_only = inventory_policy.get("eval_runtime") == "api_only"
     status_server_config = _safe_dict(status_runtime.get("server_config"))
     server_command = status_runtime.get("server_command") or sanitized_server.get("command", [])
     server_working_dir = status_runtime.get("server_working_dir") or sanitized_server.get("working_dir", ".")
@@ -1632,7 +1633,9 @@ def _write_protocol_yaml(
             "container": {
                 "image": inventory_container.get("target_image"),
                 "image_digest": inventory_container.get("target_image_digest"),
-                "image_ref": inventory_container.get("target_image_ref") or os.environ.get("SURE_EVAL_CONTAINER_IMAGE"),
+                "image_ref": None
+                if api_only
+                else inventory_container.get("target_image_ref") or os.environ.get("SURE_EVAL_CONTAINER_IMAGE"),
                 "dockerfile": os.environ.get("SURE_EVAL_DOCKERFILE") or model_cfg.get("dockerfile"),
                 "repo_root": os.environ.get("SURE_EVAL_CONTAINER_REPO_ROOT") or str(HARNESS_ROOT),
                 "model_dir": str(model_dir) if model_dir else None,
@@ -1653,7 +1656,7 @@ def _write_protocol_yaml(
             },
             "evaluation_runtime": evaluation_runtime,
             "server": {
-                "transport": "stdio_jsonrpc",
+                "transport": "api_wrapper" if api_only else "stdio_jsonrpc",
                 "command": server_command,
                 "working_dir": server_working_dir,
                 "tool_name": selected_tool_name,
@@ -1685,7 +1688,9 @@ def _write_protocol_yaml(
                     if path is not None
                 ],
                 "reject_repo_internal_runtime_mount_overlays": True,
-                "nfs_models_read_only": _nested_dict(inventory_container, "mount_policy").get("nfs_models_read_only"),
+                "nfs_models_read_only": True
+                if api_only
+                else _nested_dict(inventory_container, "mount_policy").get("nfs_models_read_only"),
                 "result_workspace": _nested_dict(_nested_dict(inventory_container, "mount_policy"), "result_workspace"),
             },
         },

@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from container_execution import build_local_container_command, effective_container_exit_code
+from container_execution import build_api_execution_command, build_local_container_command, deployment_execution_mode, effective_container_exit_code
 
 
 def _utc_now() -> str:
@@ -148,18 +148,28 @@ def main() -> int:
         raise FileNotFoundError(f"execution_surface.json not found or invalid: {surface_path}")
     eval_input = _read_json(artifacts_dir / "eval_input_resolved.json")
     execution = _execution_from_surface(surface, eval_input)
+    deployment_mode = deployment_execution_mode(eval_input)
     vc_available = _vc_available()
-    if execution["requested"] == "vc" or execution["path_planned"] == "vc_submit":
+    if deployment_mode == "api_only":
+        if execution["requested"] == "vc" or execution["path_planned"] == "vc_submit":
+            raise RuntimeError("Refusing API execution because the resolved execution plan requires vc_submit.")
+    elif execution["requested"] == "vc" or execution["path_planned"] == "vc_submit":
         raise RuntimeError("Refusing local execution because the resolved execution plan requires vc_submit.")
-    if execution["path_planned"] != "local_docker":
+    if deployment_mode == "api_only":
+        if execution["path_planned"] != "api":
+            raise RuntimeError("Refusing API execution because the resolved execution plan is not api.")
+    elif execution["path_planned"] != "local_docker":
         raise RuntimeError("Refusing host execution: local inference must use local_docker.")
-    if execution["requested"] == "auto" and vc_available and not args.allow_auto_local_override:
+    if deployment_mode != "api_only" and execution["requested"] == "auto" and vc_available and not args.allow_auto_local_override:
         raise RuntimeError("Refusing local execution because execution=auto and vc is available; submit through vc instead.")
 
     entrypoint = _entrypoint(surface)
     host = socket.gethostname()
     device_request = _device_request(surface, eval_input)
     device_env, device_actual, cuda_visible = _local_device_env(device_request)
+    if deployment_mode == "api_only":
+        device_actual = "api_remote"
+        cuda_visible = ""
     cwd = Path(args.cwd).expanduser().resolve() if args.cwd else Path(__file__).resolve().parents[4]
     stdout_path = artifacts_dir / "local_execution.stdout.log"
     stderr_path = artifacts_dir / "local_execution.stderr.log"
@@ -168,49 +178,74 @@ def main() -> int:
 
     local_fallback_reason = ""
     fallback_approved = False
-    if execution["requested"] == "auto" and not vc_available:
+    if deployment_mode == "api_only":
+        local_fallback_reason = ""
+    elif execution["requested"] == "auto" and not vc_available:
         local_fallback_reason = "execution=auto selected local execution because vc is unavailable"
     elif execution["requested"] == "auto" and vc_available and args.allow_auto_local_override:
         local_fallback_reason = "execution=auto local override was explicitly allowed while vc was available"
         fallback_approved = True
 
-    command, container_binding = build_local_container_command(
-        surface=surface,
-        eval_input=eval_input,
-        control_run_dir=run_dir,
-        entrypoint=entrypoint,
-        repo_root=cwd,
-        device_request=device_request,
-        extra_env={
-            **device_env,
-            "SURE_EVAL_EXECUTION_PATH": "local_docker",
-            "SURE_EVAL_EXECUTION_REQUESTED": execution["requested"],
-            "SURE_EVAL_EXECUTION_JOB_ID": f"local:{host}:{run_dir.name}",
-            "SURE_EVAL_CONTAINER_REPO_ROOT": str(cwd),
-            "SURE_EVAL_VC_PARTITION": "",
-            "SURE_EVAL_VC_GPU": "0",
-            "SURE_EVAL_VC_CPU": "",
-            "SURE_EVAL_VC_MEMORY": "",
-            "SURE_EVAL_VC_NODES": "0",
-        },
-    )
+    execution_path_actual = "api" if deployment_mode == "api_only" else "local_docker"
+    extra_env = {
+        **device_env,
+        "SURE_EVAL_EXECUTION_PATH": execution_path_actual,
+        "SURE_EVAL_EXECUTION_REQUESTED": execution["requested"],
+        "SURE_EVAL_EXECUTION_JOB_ID": f"{execution_path_actual}:{host}:{run_dir.name}",
+        "SURE_EVAL_CONTAINER_REPO_ROOT": str(cwd),
+        "SURE_EVAL_VC_PARTITION": "",
+        "SURE_EVAL_VC_GPU": "0",
+        "SURE_EVAL_VC_CPU": "",
+        "SURE_EVAL_VC_MEMORY": "",
+        "SURE_EVAL_VC_NODES": "0",
+    }
+    if deployment_mode == "api_only":
+        command, container_binding, command_env = build_api_execution_command(
+            surface=surface,
+            eval_input=eval_input,
+            control_run_dir=run_dir,
+            entrypoint=entrypoint,
+            repo_root=cwd,
+            device_request=device_request,
+            extra_env=extra_env,
+        )
+    else:
+        command, container_binding = build_local_container_command(
+            surface=surface,
+            eval_input=eval_input,
+            control_run_dir=run_dir,
+            entrypoint=entrypoint,
+            repo_root=cwd,
+            device_request=device_request,
+            extra_env=extra_env,
+        )
+        command_env = {}
 
     start = time.monotonic()
     started_at = _utc_now()
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
-        process = subprocess.Popen(command, cwd=cwd, env=os.environ.copy(), stdout=stdout, stderr=stderr, text=True)
+        child_env = os.environ.copy()
+        child_env.update(command_env)
+        process = subprocess.Popen(command, cwd=cwd, env=child_env, stdout=stdout, stderr=stderr, text=True)
         submit_payload = {
-            "execution_path": "local_docker",
+            "execution_path": execution_path_actual,
             "execution_requested": execution["requested"],
             "execution": {
                 "requested": execution["requested"],
-                "actual": "local",
-                "path_actual": "local_docker",
+                "actual": "api" if deployment_mode == "api_only" else "local",
+                "path_actual": execution_path_actual,
             },
             "vc_available": vc_available,
             "vc_job_id": "",
             "vc_info": "local execution selected by user or auto policy",
-            "vc_image": str(container_binding["image_ref"]),
+            "vc_image": str(container_binding.get("image_ref") or ""),
+            "image_digest": str(container_binding.get("image_digest") or ""),
+            "image_identity_ref": str(container_binding.get("image_ref") or ""),
+            "deployment_binding": (eval_input.get("model") or {}).get("deployment_binding")
+            if isinstance(eval_input.get("model"), dict)
+            else {},
+            "harness_runtime": container_binding.get("harness_runtime", {}),
+            "model_runtime": container_binding.get("model_runtime", {}),
             "fallback_approved": fallback_approved,
             "local_fallback_reason": local_fallback_reason,
             "submitted_at": started_at,
@@ -233,7 +268,7 @@ def main() -> int:
     job_status = "succeeded" if returncode == 0 else "failed"
     execution_payload = {
         "job_status": job_status,
-        "execution_path": "local_docker",
+        "execution_path": execution_path_actual,
         "execution_requested": execution["requested"],
         "host": host,
         "pid": submit_payload["pid"],

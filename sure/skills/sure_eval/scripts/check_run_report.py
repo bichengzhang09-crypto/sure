@@ -179,10 +179,15 @@ def _validate_protocol(root: Path) -> list[str]:
     runtime_inventory = inference_environment.get("runtime_inventory") if isinstance(inference_environment.get("runtime_inventory"), dict) else {}
     harness_runtime = inference_environment.get("harness_runtime") if isinstance(inference_environment.get("harness_runtime"), dict) else {}
     mount_policy = inference_environment.get("mount_policy") if isinstance(inference_environment.get("mount_policy"), dict) else {}
-    if "@sha256:" not in str(container.get("image_ref") or ""):
-        errors.append("protocol.yaml container.image_ref must be digest-pinned")
-    if container.get("execution_mode") != "container_only":
-        errors.append("protocol.yaml container.execution_mode must be container_only")
+    execution_mode = str(container.get("execution_mode") or "")
+    if execution_mode == "api_only":
+        if container.get("image_ref"):
+            errors.append("protocol.yaml API-only container.image_ref must be empty")
+    else:
+        if "@sha256:" not in str(container.get("image_ref") or ""):
+            errors.append("protocol.yaml container.image_ref must be digest-pinned")
+        if execution_mode != "container_only":
+            errors.append("protocol.yaml container.execution_mode must be container_only")
     if container.get("host_python_fallback") is not False:
         errors.append("protocol.yaml must disable container host_python_fallback")
     if runtime_inventory.get("schema") != "sure.onboard.runtime_inventory.v2":
@@ -412,6 +417,8 @@ def _execution_requested(data: dict[str, Any], run_dir: Path, report_path: Path)
                 return value
             if value == "vc_submit":
                 return "vc"
+            if value == "api":
+                return "api"
             if value in {"local_bash", "local_docker"}:
                 return "local"
 
@@ -424,6 +431,8 @@ def _execution_requested(data: dict[str, Any], run_dir: Path, report_path: Path)
     execution_path_declared = str(data.get("execution_path_declared") or "")
     if execution_path_declared == "vc_submit":
         return "vc"
+    if execution_path_declared == "api":
+        return "api"
     if execution_path_declared in {"local_bash", "local_docker"}:
         return "local"
     return "auto"
@@ -513,6 +522,9 @@ def _validate_failed_execution_report(run_dir: Path, report_path: Path, data: di
 
 
 def _submitted_image_error(execution_path: str, submit_result: dict, approved: dict) -> str | None:
+    policy = approved.get("policy") if isinstance(approved.get("policy"), dict) else {}
+    if policy.get("execution_mode") == "api_only":
+        return None
     approved_ref = str(approved.get("target_image_ref") or "")
     if execution_path != "vc_submit":
         actual_ref = ((submit_result.get("container_binding") or {}).get("image_ref")) or submit_result.get("vc_image")
@@ -564,7 +576,7 @@ def main() -> int:
     if not execution_path_actual:
         print(
             "RUN_REPORT_UNIT gate: execution_path_actual must be declared "
-            "(vc_submit / local_bash / local_docker).",
+            "(vc_submit / local_bash / local_docker / api).",
             file=sys.stderr,
         )
         return 1
@@ -583,14 +595,27 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if not failed_pre_submit and not evaluation_only and requested != "local" and not fallback_reason:
+        if (
+            execution_path_actual != "api"
+            and not failed_pre_submit
+            and not evaluation_only
+            and requested != "local"
+            and not fallback_reason
+        ):
             print(
                 "RUN_REPORT_UNIT gate: a non-vc execution path with execution=auto "
                 "requires a non-empty local_fallback_reason unless evaluation_only=true.",
                 file=sys.stderr,
             )
             return 1
-        if not failed_pre_submit and not evaluation_only and requested == "auto" and vc_available and not fallback_approved:
+        if (
+            execution_path_actual != "api"
+            and not failed_pre_submit
+            and not evaluation_only
+            and requested == "auto"
+            and vc_available
+            and not fallback_approved
+        ):
             print(
                 "RUN_REPORT_UNIT gate: execution=auto used local execution even though vc was available; "
                 "set fallback_approved=true for this intentional override.",

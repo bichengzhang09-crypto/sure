@@ -8,7 +8,7 @@
 	"properties": {
 		"execution_path": {
 			"type": "string",
-			"enum": ["vc_submit", "local_bash", "local_docker"]
+			"enum": ["vc_submit", "local_bash", "local_docker", "api"]
 		},
 		"vc_available": {
 			"type": "boolean",
@@ -16,7 +16,7 @@
 		},
 		"vc_job_id": { "type": "string" },
 		"vc_info": { "type": "string" },
-		"execution_requested": { "type": "string", "enum": ["auto", "local", "vc"] },
+		"execution_requested": { "type": "string", "enum": ["auto", "local", "vc", "api"] },
 		"execution": { "type": "object", "additionalProperties": true },
 		"fallback_approved": { "type": "boolean" },
 		"local_fallback_reason": { "type": "string" },

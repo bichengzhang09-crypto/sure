@@ -299,15 +299,20 @@ def _nvidia_smi_available() -> bool:
 def _resolve_device(requested: str, execution: dict[str, Any] | None = None) -> dict[str, Any]:
     request = (requested or "auto").strip()
     lowered = request.lower()
-    cuda_available = _nvidia_smi_available()
     execution = execution or {}
     planned_path = str(execution.get("path_planned") or "")
     planned_execution = str(execution.get("planned") or "")
     vc_planned = planned_path == "vc_submit" or planned_execution == "vc"
+    api_planned = planned_path == "api" or planned_execution == "api"
+    cuda_available = False
     notes: list[str] = []
     source = "local_nvidia_smi"
 
-    if vc_planned:
+    if api_planned:
+        source = "api_remote"
+        resolved = "api_remote"
+        notes.append("API-only inference runs on the remote provider; local CUDA devices are not used.")
+    elif vc_planned:
         source = "vc_allocation"
         cuda_available = True
         cuda_index = re.fullmatch(r"cuda:(\d+)", lowered)
@@ -327,14 +332,16 @@ def _resolve_device(requested: str, execution: dict[str, Any] | None = None) -> 
             notes.append("execution=vc will still submit to vc, but model inference is explicitly requested on CPU.")
         else:
             raise ValueError(f"Unsupported device: {requested}. Use auto, cpu, cuda, or cuda:<index>.")
-    elif lowered == "auto":
-        resolved = "cuda:0" if cuda_available else "cpu"
-    elif lowered == "cuda":
-        resolved = "cuda:0"
-    elif lowered.startswith("cuda") or lowered == "cpu":
-        resolved = request
     else:
-        raise ValueError(f"Unsupported device: {requested}. Use auto, cpu, cuda, or cuda:<index>.")
+        cuda_available = _nvidia_smi_available()
+        if lowered == "auto":
+            resolved = "cuda:0" if cuda_available else "cpu"
+        elif lowered == "cuda":
+            resolved = "cuda:0"
+        elif lowered.startswith("cuda") or lowered == "cpu":
+            resolved = request
+        else:
+            raise ValueError(f"Unsupported device: {requested}. Use auto, cpu, cuda, or cuda:<index>.")
     return {
         "request": request,
         "resolved": resolved,
@@ -342,6 +349,34 @@ def _resolve_device(requested: str, execution: dict[str, Any] | None = None) -> 
         "cpu_forces_cuda_hidden": resolved.lower() == "cpu",
         "execution_device_source": source,
         "notes": notes,
+    }
+
+
+def _normalize_api_execution(execution: str | None, execution_path: str | None) -> dict[str, Any]:
+    requested_raw = (execution or "").strip().lower()
+    path_raw = (execution_path or "").strip().lower()
+    if path_raw in {"vc_submit", "local_bash", "local_docker"}:
+        raise ValueError("API-only models must use execution_path=api or auto.")
+    aliases = {
+        "": "auto",
+        "auto": "auto",
+        "api": "api",
+        "remote_api": "api",
+        "local": "api",
+    }
+    requested = aliases.get(requested_raw)
+    if requested is None:
+        raise ValueError("API-only models support execution=auto or execution=api; vc is not valid.")
+    if path_raw not in {"", "auto", "api"}:
+        raise ValueError("API-only models must use execution_path=api or auto.")
+    return {
+        "requested": requested,
+        "planned": "api",
+        "path_requested": path_raw or "auto",
+        "path_planned": "api",
+        "vc_available_at_resolve": False,
+        "fallback_allowed": requested == "auto",
+        "reason": "api_only_remote_execution",
     }
 
 
@@ -709,7 +744,16 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     languages = _dedupe([str(item.get("language") or "") for item in datasets if item.get("language")])
     metric_list = _dedupe([metric for item in datasets for metric in item.get("default_metrics", [])])
     allowed_surfaces = list(active_site_policy["policy"]["execution"]["surfaces"])
-    execution = _normalize_execution(args.execution, args.execution_path, allowed_surfaces)
+    deployment_policy = (model.get("deployment_binding") or {}).get("policy")
+    deployment_mode = (
+        str(deployment_policy.get("execution_mode") or "")
+        if isinstance(deployment_policy, dict)
+        else ""
+    )
+    if deployment_mode == "api_only":
+        execution = _normalize_api_execution(args.execution, args.execution_path)
+    else:
+        execution = _normalize_execution(args.execution, args.execution_path, allowed_surfaces)
     device = _resolve_device(args.device, execution)
     vc_request = _vc_request(args)
     approved_image = str((model.get("deployment_binding") or {}).get("target_image_ref") or "")
@@ -822,8 +866,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--metrics", nargs="*", default=[])
     parser.add_argument("--max-samples", type=int, default=0)
-    parser.add_argument("--execution", choices=("auto", "local", "vc"))
-    parser.add_argument("--execution-path", default="auto", choices=("local_bash", "local_docker", "vc_submit", "auto"))
+    parser.add_argument("--execution", choices=("auto", "local", "vc", "api"))
+    parser.add_argument("--execution-path", default="auto", choices=("local_bash", "local_docker", "vc_submit", "api", "auto"))
     parser.add_argument("--vc-partition", default="")
     parser.add_argument("--vc-cpu", type=int, default=0)
     parser.add_argument("--vc-mem", default="")
